@@ -125,7 +125,9 @@ class Attention(nn.Module):
             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
         ).cuda()
 
-        self.gate = torch.nn.Parameter(torch.zeros(1, self.n_local_heads, 1, 1))
+        self.gate = torch.nn.Parameter(torch.zeros(1, args.n_heads, 1, 1))
+        self.head_start = self.n_local_heads * fs_init.get_model_parallel_rank()
+        self.head_end = self.n_local_heads * (fs_init.get_model_parallel_rank() + 1)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], adapter=None):
         bsz, seqlen, _ = x.shape
@@ -164,7 +166,9 @@ class Attention(nn.Module):
 
         if adapter is not None:
             adapter_scores = torch.matmul(xq, adapter_k.transpose(2, 3)) / math.sqrt(self.head_dim)
-            adapter_scores = self.gate.tanh() * F.softmax(adapter_scores.float(), dim=-1).type_as(xq)
+            adapter_scores = self.gate[
+                :, self.head_start : self.head_end
+            ].tanh() * F.softmax(adapter_scores.float(), dim=-1).type_as(xq)
             output = output + torch.matmul(adapter_scores, adapter_v)
 
         output = output.transpose(
