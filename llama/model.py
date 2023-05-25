@@ -325,22 +325,15 @@ class Transformer(nn.Module):
             mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers[:-1 * self.adapter_layer]:
-            if visual_tokens is not None and layer in self.params.vision_early_fusion:
-                h = layer(h, start_pos, freqs_cis, mask, visual_tokens)
-            else:
-                h = layer(h, start_pos, freqs_cis, mask)
-
-        layer_index = 0
-        for layer in self.layers[-1 * self.adapter_layer:]:
-            adapter_per_layer = adapter[layer_index]
+        for i, layer in enumerate(self.layers):
+            adapter_index = i - (len(self.layers) - self.adapter_layer)
+            adapter_per_layer = adapter[adapter_index] if adapter_index >= 0 else None
             if visual_tokens is not None:
-                if layer in self.params.vision_early_fusion:
+                if i in self.params.vision_early_fusion:
                     adapter_per_layer = visual_tokens
-                else:
-                    adapter_per_layer = adapter_per_layer + visual_tokens
+                elif adapter_per_layer is not None:
+                    adapter_per_layer += visual_tokens
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
-            layer_index = layer_index + 1
 
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
