@@ -45,6 +45,7 @@ model_args = ModelArgs(
     vision_dim = 64,
     vision_blocks = 2,
 )
+model_args.vision_early_fusion.add(0)
 
 tokenizer_path = hf_hub_download(
     repo_id="huggyllama/llama-7b", filename="tokenizer.model")

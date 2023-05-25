@@ -2,7 +2,7 @@
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
 from typing import Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 import clip
@@ -41,6 +41,7 @@ class ModelArgs:
     vision_clip_model: str = "ViT-L/14"
     vision_dim: int = 512
     vision_blocks: int = 2
+    vision_early_fusion: set = field(default_factory=set)
 
 
 class RMSNorm(torch.nn.Module):
@@ -324,15 +325,23 @@ class Transformer(nn.Module):
             mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers[: -1 * self.adapter_layer]:
-            h = layer(h, start_pos, freqs_cis, mask)
+        for layer in self.layers[:-1 * self.adapter_layer]:
+            if visual_tokens is not None and layer in self.params.vision_early_fusion:
+                h = layer(h, start_pos, freqs_cis, mask, visual_tokens)
+            else:
+                h = layer(h, start_pos, freqs_cis, mask)
+
         layer_index = 0
         for layer in self.layers[-1 * self.adapter_layer:]:
             adapter_per_layer = adapter[layer_index]
             if visual_tokens is not None:
-                adapter_per_layer = adapter_per_layer + visual_tokens
+                if layer in self.params.vision_early_fusion:
+                    adapter_per_layer = visual_tokens
+                else:
+                    adapter_per_layer = adapter_per_layer + visual_tokens
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
             layer_index = layer_index + 1
+
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
