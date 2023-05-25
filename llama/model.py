@@ -34,6 +34,10 @@ class ModelArgs:
     adapter_len: int = 10
     adapter_layer: int = 30
 
+    add_bias: bool = False
+    add_scale: bool = False
+    train_norm: bool = False
+
     vision_clip_model: str = "ViT-L/14"
     vision_dim: int = 512
     vision_blocks: int = 2
@@ -80,6 +84,15 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def forward_linear_with_scale_and_bias(x, module, scale=None, bias=None):
+    if scale is not None:
+        x = x * scale
+    x = module(x)
+    if bias is not None:
+        x = x + bias
+    return x
 
 
 class Attention(nn.Module):
@@ -129,9 +142,27 @@ class Attention(nn.Module):
         self.head_start = self.n_local_heads * fs_init.get_model_parallel_rank()
         self.head_end = self.n_local_heads * (fs_init.get_model_parallel_rank() + 1)
 
+        if args.add_bias:
+            self.wq_bias, self.wk_bias, self.wv_bias = [
+                nn.Parameter(torch.zeros([self.n_local_heads * self.head_dim])) for _ in range(3)
+            ]
+            self.wo_bias = nn.Parameter(torch.zeros([args.dim]))
+        else:
+            self.wq_bias = self.wk_bias = self.wv_bias = self.wo_bias = None
+
+        if args.add_scale:
+            self.wq_scale, self.wk_scale, self.wv_scale = [
+                nn.Parameter(torch.ones([args.dim])) for _ in range(3)
+            ]
+            self.wo_scale = nn.Parameter(torch.ones([self.n_local_heads * self.head_dim]))
+        else:
+            self.wq_scale = self.wk_scale = self.wv_scale = self.wo_scale = None
+
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], adapter=None):
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = forward_linear_with_scale_and_bias(x, self.wq, self.wq_scale, self.wq_bias)
+        xk = forward_linear_with_scale_and_bias(x, self.wk, self.wk_scale, self.wk_bias)
+        xv = forward_linear_with_scale_and_bias(x, self.wv, self.wv_scale, self.wv_bias)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -150,32 +181,39 @@ class Attention(nn.Module):
 
         if adapter is not None:
            adapter_len = adapter.shape[1]
-           adapter_k = self.wk(adapter).view(bsz, adapter_len, self.n_local_heads, self.head_dim)
-           adapter_v = self.wv(adapter).view(bsz, adapter_len, self.n_local_heads, self.head_dim)
+           adapter_k = forward_linear_with_scale_and_bias(adapter, self.wk, self.wk_scale, self.wk_bias)
+           adapter_k = adapter_k.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
+           adapter_v = forward_linear_with_scale_and_bias(adapter, self.wv, self.wv_scale, self.wv_bias)
+           adapter_v = adapter_v.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
            adapter_k = adapter_k.transpose(1, 2)
            adapter_v = adapter_v.transpose(1, 2)
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
+        output = self._forward_scaled_dot_product_attention(xq, keys, values, mask)
 
         if adapter is not None:
-            adapter_scores = torch.matmul(xq, adapter_k.transpose(2, 3)) / math.sqrt(self.head_dim)
-            adapter_scores = self.gate[
+            output += self.gate[
                 :, self.head_start : self.head_end
-            ].tanh() * F.softmax(adapter_scores.float(), dim=-1).type_as(xq)
-            output = output + torch.matmul(adapter_scores, adapter_v)
+            ].tanh() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
 
         output = output.transpose(
             1, 2
         ).contiguous().view(bsz, seqlen, -1)
 
-        return self.wo(output)
+        return forward_linear_with_scale_and_bias(output, self.wo, self.wo_scale, self.wo_bias)
+    
+    def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
+        if hasattr(F, "scaled_dot_product_attention"):
+            return F.scaled_dot_product_attention(q, k, v, mask >= 0 if mask is not None else None)
+
+        scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        output = torch.matmul(scores, v)  # (bs, n_local_heads, slen, head_dim)
+        return output
 
 
 class FeedForward(nn.Module):
@@ -184,10 +222,14 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
+        add_bias: bool = False,
+        add_scale: bool = False,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        mp_size = fs_init.get_model_parallel_world_size()
 
         self.w1 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
@@ -199,8 +241,22 @@ class FeedForward(nn.Module):
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
+        if add_bias:
+            self.w1_bias, self.w3_bias = [nn.Parameter(torch.zeros([hidden_dim // mp_size])) for _ in range(2)]
+            self.w2_bias = nn.Parameter(torch.zeros([dim]))
+        else:
+            self.w1_bias = self.w2_bias = self.w3_bias = None
+
+        if add_scale:
+            self.w1_scale, self.w3_scale = [nn.Parameter(torch.ones([dim])) for _ in range(2)]
+            self.w2_scale = nn.Parameter(torch.ones([hidden_dim // mp_size]))
+        else:
+            self.w1_scale = self.w2_scale = self.w3_scale = None
+
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        xw1 = forward_linear_with_scale_and_bias(x, self.w1, self.w1_scale, self.w1_bias)
+        xw3 = forward_linear_with_scale_and_bias(x, self.w3, self.w3_scale, self.w3_bias)
+        return forward_linear_with_scale_and_bias(F.silu(xw1) * xw3, self.w2, self.w2_scale, self.w2_bias)
 
 
 class TransformerBlock(nn.Module):
@@ -211,7 +267,11 @@ class TransformerBlock(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
-            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            add_bias=args.add_bias,
+            add_scale=args.add_scale,
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
