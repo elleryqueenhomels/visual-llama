@@ -36,7 +36,9 @@ class ModelArgs:
 
     add_bias: bool = False
     add_scale: bool = False
-    train_norm: bool = False
+
+    use_lora: bool = False
+    lora_rank: int = 16
 
     vision_clip_model: str = "ViT-L/14"
     vision_dim: int = 512
@@ -158,12 +160,36 @@ class Attention(nn.Module):
             self.wo_scale = nn.Parameter(torch.ones([self.n_local_heads * self.head_dim]))
         else:
             self.wq_scale = self.wk_scale = self.wv_scale = self.wo_scale = None
+        
+        self.use_lora = args.use_lora
+        if args.use_lora:
+           self.lora_wq_l1 = nn.Linear(args.dim, args.lora_rank, bias=False)
+           self.lora_wq_l2 = nn.Linear(args.lora_rank, args.dim, bias=False)
+
+           self.lora_wk_l1 = nn.Linear(args.dim, args.lora_rank, bias=False)
+           self.lora_wk_l2 = nn.Linear(args.lora_rank, args.dim, bias=False)
+
+           self.lora_wv_l1 = nn.Linear(args.dim, args.lora_rank, bias=False)
+           self.lora_wv_l2 = nn.Linear(args.lora_rank, args.dim, bias=False)
+
+           self.lora_wo_l1 = nn.Linear(args.dim, args.lora_rank, bias=False)
+           self.lora_wo_l2 = nn.Linear(args.lora_rank, args.dim, bias=False)
+
+           nn.init.constant_(self.lora_wq_l2.weight.data, 0)
+           nn.init.constant_(self.lora_wk_l2.weight.data, 0)
+           nn.init.constant_(self.lora_wv_l2.weight.data, 0)
+           nn.init.constant_(self.lora_wo_l2.weight.data, 0)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], adapter=None):
         bsz, seqlen, _ = x.shape
         xq = forward_linear_with_scale_and_bias(x, self.wq, self.wq_scale, self.wq_bias)
         xk = forward_linear_with_scale_and_bias(x, self.wk, self.wk_scale, self.wk_bias)
         xv = forward_linear_with_scale_and_bias(x, self.wv, self.wv_scale, self.wv_bias)
+
+        if self.use_lora:
+           xq = xq + self.lora_wq_l2(self.lora_wq_l1(x))
+           xk = xk + self.lora_wk_l2(self.lora_wk_l1(x))
+           xv = xv + self.lora_wv_l2(self.lora_wv_l1(x))
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -197,7 +223,7 @@ class Attention(nn.Module):
         if adapter is not None:
             output += self.gate[
                 :, self.head_start : self.head_end
-            ].tanh() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
+            ].tanh().half() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
 
         output = output.transpose(
             1, 2
@@ -223,8 +249,7 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
-        add_bias: bool = False,
-        add_scale: bool = False,
+        args: ModelArgs,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
@@ -242,22 +267,43 @@ class FeedForward(nn.Module):
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
-        if add_bias:
+        if args.add_bias:
             self.w1_bias, self.w3_bias = [nn.Parameter(torch.zeros([hidden_dim // mp_size])) for _ in range(2)]
             self.w2_bias = nn.Parameter(torch.zeros([dim]))
         else:
             self.w1_bias = self.w2_bias = self.w3_bias = None
 
-        if add_scale:
+        if args.add_scale:
             self.w1_scale, self.w3_scale = [nn.Parameter(torch.ones([dim])) for _ in range(2)]
             self.w2_scale = nn.Parameter(torch.ones([hidden_dim // mp_size]))
         else:
             self.w1_scale = self.w2_scale = self.w3_scale = None
+        
+        self.use_lora = args.use_lora
+        if args.use_lora:
+           self.lora_w1_l1 = nn.Linear(dim, args.lora_rank, bias=False)
+           self.lora_w1_l2 = nn.Linear(args.lora_rank, hidden_dim, bias=False)
+           self.lora_w2_l1 = nn.Linear(hidden_dim, args.lora_rank, bias=False)
+           self.lora_w2_l2 = nn.Linear(args.lora_rank, dim, bias=False)
+           self.lora_w3_l1 = nn.Linear(dim, args.lora_rank, bias=False)
+           self.lora_w3_l2 = nn.Linear(args.lora_rank, hidden_dim, bias=False)
+           nn.init.constant_(self.lora_w1_l2.weight.data, 0)
+           nn.init.constant_(self.lora_w2_l2.weight.data, 0)
+           nn.init.constant_(self.lora_w3_l2.weight.data, 0)
 
     def forward(self, x):
         xw1 = forward_linear_with_scale_and_bias(x, self.w1, self.w1_scale, self.w1_bias)
         xw3 = forward_linear_with_scale_and_bias(x, self.w3, self.w3_scale, self.w3_bias)
-        return forward_linear_with_scale_and_bias(F.silu(xw1) * xw3, self.w2, self.w2_scale, self.w2_bias)
+        if self.use_lora:
+            xw1 = xw1 + self.lora_w1_l2(self.lora_w1_l1(x))
+            xw3 = xw3 + self.lora_w3_l2(self.lora_w3_l1(x))
+
+        act = F.silu(xw1) * xw3
+        out = forward_linear_with_scale_and_bias(act, self.w2, self.w2_scale, self.w2_bias)
+        if self.use_lora:
+            out = out + self.lora_w2_l2(self.lora_w2_l1(act))
+
+        return out
 
 
 class TransformerBlock(nn.Module):
@@ -271,8 +317,7 @@ class TransformerBlock(nn.Module):
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
-            add_bias=args.add_bias,
-            add_scale=args.add_scale,
+            args=args,
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -333,6 +378,8 @@ class Transformer(nn.Module):
                     adapter_per_layer = visual_tokens
                 elif adapter_per_layer is not None:
                     adapter_per_layer += visual_tokens
+            if adapter_per_layer.shape[0] == 1:
+                adapter_per_layer = adapter_per_layer.repeat(_bsz, 1, 1)
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
 
         h = self.norm(h)

@@ -44,8 +44,11 @@ model_args = ModelArgs(
     vision_clip_model = "ViT-L/14",
     vision_dim = 64,
     vision_blocks = 2,
+    vision_early_fusion = {0},
+    add_bias=True,
+    add_scale=True,
+    use_lora=True,
 )
-model_args.vision_early_fusion.add(0)
 
 tokenizer_path = hf_hub_download(
     repo_id="huggyllama/llama-7b", filename="tokenizer.model")
