@@ -230,7 +230,7 @@ class Attention(nn.Module):
         ).contiguous().view(bsz, seqlen, -1)
 
         return forward_linear_with_scale_and_bias(output, self.wo, self.wo_scale, self.wo_bias)
-    
+
     def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
         if hasattr(F, "scaled_dot_product_attention"):
             return F.scaled_dot_product_attention(q, k, v, mask >= 0 if mask is not None else None)
@@ -278,7 +278,7 @@ class FeedForward(nn.Module):
             self.w2_scale = nn.Parameter(torch.ones([hidden_dim // mp_size]))
         else:
             self.w1_scale = self.w2_scale = self.w3_scale = None
-        
+
         self.use_lora = args.use_lora
         if args.use_lora:
            self.lora_w1_l1 = nn.Linear(dim, args.lora_rank, bias=False)
@@ -357,8 +357,9 @@ class Transformer(nn.Module):
         self.adapter_len = params.adapter_len
         self.adapter_layer = params.adapter_layer
 
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, visual_tokens: torch.Tensor = None):
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+
+    def _compute_hidden(self, tokens: torch.Tensor, start_pos: int, visual_tokens: torch.Tensor = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -383,6 +384,21 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
 
         h = self.norm(h)
+        return h
+
+    def forward_train(self, tokens, visual_tokens, labels):
+        h = self._compute_hidden(tokens=tokens, start_pos=0, visual_tokens=visual_tokens)
+        output = self.output(h)
+
+        output = output[:, :-1, :].reshape(-1, self.vocab_size)
+        labels = labels[:, 1:].flatten()
+
+        loss = self.loss_fn(output, labels)
+        return loss
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int, visual_tokens: torch.Tensor = None):
+        h = self._compute_hidden(tokens=tokens, start_pos=start_pos, visual_tokens=visual_tokens)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
 
@@ -406,10 +422,10 @@ class VisionModel(nn.Module):
         self.visual_blocks = nn.ModuleList([
             nn.MultiheadAttention(params.vision_dim, 16, add_bias_kv=True, batch_first=True)
         for _ in range(params.vision_blocks)])
-        
+
         self.visual_proj = nn.Linear(params.vision_dim, params.dim)
         self.visual_proj_norm = nn.LayerNorm(params.dim)
-        
+
     def clip_encode_image(self, x):
         x = self.clip.visual.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
