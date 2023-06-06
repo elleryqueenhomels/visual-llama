@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import json
 import random
@@ -21,6 +22,20 @@ from torch.distributed import init_process_group, destroy_process_group
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
 
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+}
+
+
 def setup_model_parallel():
     init_process_group(backend="nccl")
     initialize_model_parallel(int(os.environ["WORLD_SIZE"]))
@@ -34,6 +49,30 @@ def setup_random_seeds(random_seed=0):
     cudnn.benchmark = False
     np.random.seed(random_seed)
     random.seed(random_seed)
+
+
+def construct_sample(ann: dict, tokenizer: Tokenizer, max_words: int):
+    if ann.get("input", "") == "":
+        prompt = PROMPT_DICT["prompt_no_input"].format_map(ann)
+    else:
+        prompt = PROMPT_DICT["prompt_input"].format_map(ann)
+    example = prompt + ann["output"]
+    prompt = torch.tensor(tokenizer.encode(prompt, bos=True, eos=False), dtype=torch.int64)
+    example = torch.tensor(tokenizer.encode(example, bos=True, eos=True), dtype=torch.int64)
+    padding = max_words - example.shape[0]
+    if padding > 0:
+        example = torch.cat((example, torch.zeros(padding, dtype=torch.int64) - 1))
+    elif padding < 0:
+        example = example[: max_words]
+    labels = copy.deepcopy(example)
+    labels[: len(prompt)] = -1
+    example_mask = example.ge(0)
+    label_mask = labels.ge(0)
+    example[~example_mask] = 0
+    labels[~label_mask] = 0
+    example_mask = example_mask.float()
+    label_mask = label_mask.float()
+    return example, labels, example_mask
 
 
 class Trainer:
@@ -86,7 +125,7 @@ class Trainer:
         b_sz = len(next(iter(self.train_data))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
-        for (tokens, imgs), labels in self.train_data:
+        for tokens, imgs, labels in self.train_data:
             tokens = tokens.to(self.gpu_id)
             visual_tokens = self.vision_model(imgs) if imgs is not None else None
             self._run_batch(tokens, visual_tokens, labels)
@@ -99,13 +138,45 @@ class Trainer:
 
 
 class InstructionDataset(Dataset):
-    def __init__(self):
-        pass
+    def __init__(self, data_path, tokenizer, max_words=30, partition="train"):
+        self.ann = json.load(open(data_path))
+        if partition == "train":
+            self.ann = self.ann
+        else:
+            self.ann = self.ann[:200]
+
+        self.max_words = max_words
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.ann)
+
+    def __getitem__(self, index):
+        return construct_sample(self.ann[index], self.tokenizer, self.max_words)
 
 
 class JointDataset(Dataset):
-    def __init__(self):
-        pass
+    def __init__(self, args, tokenizer: Tokenizer):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.cap_dataset = CocoCaptions(root='./coco', annFile='./coco/ann.json')
+        self.inst_dataset = InstructionDataset(data_path=args.data_path, tokenizer=tokenizer, max_words=args.max_seq_len)
+    
+    def __len__(self):
+        return self.cap_dataset.len() + self.inst_dataset.len()
+    
+    def __getitem__(self, index):
+        imgs = None
+        tokens = None
+        labels = None
+        if index % 2 == 0:
+            tokens, labels, _ = self.inst_dataset[index / 2]
+        else:
+            imgs, targets = self.cap_dataset[index / 2]
+            target = targets[random.randint(0, len(targets) - 1)]
+            ann = {'input': 'Describe the image', 'output': target}
+            tokens, labels, _ = construct_sample(ann, self.tokenizer, self.args.max_seq_len)
+        return tokens, imgs, labels
 
 
 def build_model(args):
@@ -154,11 +225,6 @@ def build_model(args):
     return tokenizer, model, vision_model
 
 
-def load_dataset():
-    train_set = JointDataset()
-    return train_set
-
-
 def prepare_dataloader(dataset: Dataset, batch_size: int):
     return DataLoader(
         dataset,
@@ -171,9 +237,9 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 def main(args):
     setup_model_parallel()
     setup_random_seeds(args.seed)
-    dataset = load_dataset()
-    train_data = prepare_dataloader(dataset, args.batch_size)
     tokenizer, model, vision_model = build_model(args)
+    dataset = JointDataset(args, tokenizer)
+    train_data = prepare_dataloader(dataset, args.batch_size)
     trainer = Trainer(args, tokenizer, model, vision_model, train_data)
     trainer.train()
     destroy_process_group()
@@ -208,7 +274,7 @@ def get_args_parser():
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
 
-    parser.add_argument("--lr", type=float, default=None, metavar="LR", help="learning rate (absolute lr)")
+    parser.add_argument("--lr", type=float, default=1e-5, metavar="LR", help="learning rate (absolute lr)")
     parser.add_argument(
         "--blr",
         type=float,
