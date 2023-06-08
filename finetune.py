@@ -160,7 +160,7 @@ class JointDataset(Dataset):
         self.args = args
         self.tokenizer = tokenizer
         self.cap_dataset = CocoCaptions(root=args.coco_dir, annFile=f"{args.coco_dir}/ann.json")
-        self.inst_dataset = InstructionDataset(data_path=args.inst_dir, tokenizer=tokenizer, max_words=args.max_seq_len)
+        self.inst_dataset = InstructionDataset(data_path=args.inst_path, tokenizer=tokenizer, max_words=args.max_seq_len)
     
     def __len__(self):
         return self.cap_dataset.len() + self.inst_dataset.len()
@@ -174,7 +174,7 @@ class JointDataset(Dataset):
         else:
             imgs, targets = self.cap_dataset[index / 2]
             target = targets[random.randint(0, len(targets) - 1)]
-            ann = {'input': 'Describe the image', 'output': target}
+            ann = {"instruction": "Describe the image", "output": target}
             tokens, labels, _ = construct_sample(ann, self.tokenizer, self.args.max_seq_len)
         return tokens, imgs, labels
 
@@ -289,7 +289,7 @@ def get_args_parser():
     parser.add_argument("--warmup_epochs", type=int, default=40, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
-    parser.add_argument("--inst_dir", default="/instruction_dataset", type=str, help="instruction dataset dir")
+    parser.add_argument("--inst_path", default="./instruction_dataset/data.json", type=str, help="instruction dataset path")
     parser.add_argument("--coco_dir", default="./coco", type=str, help="coco captions dataser dir")
 
     parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
@@ -321,7 +321,7 @@ def get_args_parser():
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
-    for path in [args.inst_dir, args.coco_dir, args.output_dir]:
+    for path in [args.coco_dir, args.output_dir]:
         if path:
             Path(path).mkdir(parents=True, exist_ok=True)
     main(args)
