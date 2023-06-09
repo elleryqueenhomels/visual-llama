@@ -203,10 +203,13 @@ def build_model(args):
     model = Transformer(model_args).cuda(gpu_id)
 
     # To reduce memory usuage
-    model_ckpt = torch.load(model_path, map_location=f'cuda:{gpu_id}')
+    # model_ckpt = torch.load(model_path, map_location=f'cuda:{gpu_id}')
+    # model.load_state_dict(model_ckpt, strict=False)
+    # del model_ckpt
+    # torch.cuda.empty_cache()
+    model_ckpt = torch.load(model_path, map_location='cpu')
     model.load_state_dict(model_ckpt, strict=False)
     del model_ckpt
-    torch.cuda.empty_cache()
 
     for name, param in model.named_parameters():
         requires_grad = (
