@@ -159,20 +159,20 @@ class JointDataset(Dataset):
     def __init__(self, args, tokenizer: Tokenizer):
         self.args = args
         self.tokenizer = tokenizer
-        self.cap_dataset = CocoCaptions(root=args.coco_dir, annFile=f"{args.coco_dir}/ann.json")
+        self.cap_dataset = CocoCaptions(root=args.coco_imgs_dir, annFile=args.coco_ann_file)
         self.inst_dataset = InstructionDataset(data_path=args.inst_path, tokenizer=tokenizer, max_words=args.max_seq_len)
     
     def __len__(self):
-        return self.cap_dataset.len() + self.inst_dataset.len()
+        return len(self.cap_dataset) + len(self.inst_dataset)
     
     def __getitem__(self, index):
         imgs = None
         tokens = None
         labels = None
         if index % 2 == 0:
-            tokens, labels, _ = self.inst_dataset[index / 2]
+            tokens, labels, _ = self.inst_dataset[index // 2]
         else:
-            imgs, targets = self.cap_dataset[index / 2]
+            imgs, targets = self.cap_dataset[index // 2]
             target = targets[random.randint(0, len(targets) - 1)]
             ann = {"instruction": "Describe the image", "output": target}
             tokens, labels, _ = construct_sample(ann, self.tokenizer, self.args.max_seq_len)
@@ -293,7 +293,8 @@ def get_args_parser():
 
     # Dataset parameters
     parser.add_argument("--inst_path", default="./instruction_dataset/data.json", type=str, help="instruction dataset path")
-    parser.add_argument("--coco_dir", default="./coco", type=str, help="coco captions dataser dir")
+    parser.add_argument("--coco_imgs_dir", default="./coco/train2017", type=str, help="coco images dir")
+    parser.add_argument("--coco_ann_file", default="./coco/annotations/captions_train2017.json", type=str, help="coco captions json file")
 
     parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
     parser.add_argument("--log_dir", default="./output_dir", help="path where to tensorboard log")
@@ -324,7 +325,6 @@ def get_args_parser():
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
-    for path in [args.coco_dir, args.output_dir]:
-        if path:
-            Path(path).mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
