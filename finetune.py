@@ -5,6 +5,7 @@ import json
 import random
 import numpy as np
 
+from PIL import Image
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 from llama import ModelArgs, VisionModel, Tokenizer, Transformer
@@ -125,9 +126,9 @@ class Trainer:
         b_sz = len(next(iter(self.train_data))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
-        for tokens, imgs, labels in self.train_data:
+        for tokens, imgs, hasImg, labels in self.train_data:
             tokens = tokens.to(self.gpu_id)
-            visual_tokens = self.vision_model(imgs) if imgs is not None else None
+            visual_tokens = self.vision_model(imgs) if hasImg else None
             self._run_batch(tokens, visual_tokens, labels)
 
     def train(self):
@@ -156,9 +157,11 @@ class InstructionDataset(Dataset):
 
 
 class JointDataset(Dataset):
-    def __init__(self, args, tokenizer: Tokenizer):
+    def __init__(self, args, img_transform_fn, tokenizer: Tokenizer):
         self.args = args
         self.tokenizer = tokenizer
+        self.img_transform_fn = img_transform_fn
+        self.blank_img = Image.new('RGB', (1, 1), color = 'red')
         self.cap_dataset = CocoCaptions(root=args.coco_imgs_dir, annFile=args.coco_ann_file)
         self.inst_dataset = InstructionDataset(data_path=args.inst_path, tokenizer=tokenizer, max_words=args.max_seq_len)
     
@@ -169,14 +172,19 @@ class JointDataset(Dataset):
         imgs = None
         tokens = None
         labels = None
+        hasImg = None
         if index % 2 == 0:
             tokens, labels, _ = self.inst_dataset[index // 2]
+            imgs = [self.img_transform_fn(self.blank_img)]
+            hasImg = False
         else:
+            hasImg = True
             imgs, targets = self.cap_dataset[index // 2]
+            imgs = [self.img_transform_fn(imgs)]
             target = targets[random.randint(0, len(targets) - 1)]
             ann = {"instruction": "Describe the image", "output": target}
             tokens, labels, _ = construct_sample(ann, self.tokenizer, self.args.max_seq_len)
-        return tokens, imgs, labels
+        return tokens, imgs, hasImg, labels
 
 
 def build_model(args):
@@ -232,16 +240,16 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        pin_memory=True,
+        pin_memory=False,
         shuffle=False,
-        sampler=DistributedSampler(dataset))
+        sampler=DistributedSampler(dataset, shuffle=False))
 
 
 def main(args):
     setup_model_parallel()
     setup_random_seeds(args.seed)
     tokenizer, model, vision_model = build_model(args)
-    dataset = JointDataset(args, tokenizer)
+    dataset = JointDataset(args, vision_model.clip_transform, tokenizer)
     train_data = prepare_dataloader(dataset, args.batch_size)
     trainer = Trainer(args, tokenizer, model, vision_model, train_data)
     trainer.train()

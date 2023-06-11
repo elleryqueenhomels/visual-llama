@@ -449,8 +449,11 @@ class VisionModel(nn.Module):
         return x
 
     def forward(self, imgs):
-        x = [self.clip_transform(img) for img in imgs]
-        x = torch.stack(x, dim=0).to(self.visual_query.weight.device)
+        if torch.is_tensor(imgs):
+            x = imgs.to(self.visual_query.weight.device)
+        else:
+            x = [img if torch.is_tensor(img) else self.clip_transform(img) for img in imgs]
+            x = torch.stack(x, dim=0).to(self.visual_query.weight.device)
         _bsz = x.shape[0]
 
         visual_feats = self.clip_encode_image(x).half()
