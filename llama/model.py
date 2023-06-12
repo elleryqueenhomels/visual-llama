@@ -426,7 +426,8 @@ class VisionModel(nn.Module):
         self.visual_proj = nn.Linear(params.vision_dim, params.dim)
         self.visual_proj_norm = nn.LayerNorm(params.dim)
 
-    def clip_encode_image(self, x):
+    def clip_encode_image(self, x: torch.Tensor):
+        x = x.to(self.clip.visual.conv1.weight.dtype)
         x = self.clip.visual.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]

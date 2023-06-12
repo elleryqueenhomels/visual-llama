@@ -126,9 +126,9 @@ class Trainer:
         b_sz = len(next(iter(self.train_data))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
-        for tokens, imgs, hasImg, labels in self.train_data:
+        for tokens, imgs, labels in self.train_data:
             tokens = tokens.to(self.gpu_id)
-            visual_tokens = self.vision_model(imgs) if hasImg else None
+            visual_tokens = self.vision_model(imgs)
             self._run_batch(tokens, visual_tokens, labels)
 
     def train(self):
@@ -161,7 +161,6 @@ class JointDataset(Dataset):
         self.args = args
         self.tokenizer = tokenizer
         self.img_transform_fn = img_transform_fn
-        self.blank_img = Image.new('RGB', (1, 1), color = 'red')
         self.cap_dataset = CocoCaptions(root=args.coco_imgs_dir, annFile=args.coco_ann_file)
         self.inst_dataset = InstructionDataset(data_path=args.inst_path, tokenizer=tokenizer, max_words=args.max_seq_len)
     
@@ -172,19 +171,17 @@ class JointDataset(Dataset):
         imgs = None
         tokens = None
         labels = None
-        hasImg = None
         if index % 2 == 0:
             tokens, labels, _ = self.inst_dataset[index // 2]
-            imgs = [self.img_transform_fn(self.blank_img)]
-            hasImg = False
+            imgs = torch.zeros(3, 224, 224)
         else:
-            hasImg = True
             imgs, targets = self.cap_dataset[index // 2]
-            imgs = [self.img_transform_fn(imgs)]
+            imgs = self.img_transform_fn(imgs)
             target = targets[random.randint(0, len(targets) - 1)]
             ann = {"instruction": "Describe the image", "output": target}
             tokens, labels, _ = construct_sample(ann, self.tokenizer, self.args.max_seq_len)
-        return tokens, imgs, hasImg, labels
+        imgs = imgs.to(tokens.device)
+        return tokens, imgs, labels
 
 
 def build_model(args):
