@@ -374,13 +374,13 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             adapter_index = i - (len(self.layers) - self.adapter_layer)
             adapter_per_layer = adapter[adapter_index] if adapter_index >= 0 else None
+            if adapter_per_layer is not None and adapter_per_layer.shape[0] == 1:
+                adapter_per_layer = adapter_per_layer.repeat(_bsz, 1, 1)
             if visual_tokens is not None:
                 if i in self.params.vision_early_fusion:
                     adapter_per_layer = visual_tokens
                 elif adapter_per_layer is not None:
                     adapter_per_layer += visual_tokens
-            if adapter_per_layer is not None and adapter_per_layer.shape[0] == 1:
-                adapter_per_layer = adapter_per_layer.repeat(_bsz, 1, 1)
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
 
         h = self.norm(h)
