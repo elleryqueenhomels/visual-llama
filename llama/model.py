@@ -379,7 +379,7 @@ class Transformer(nn.Module):
                     adapter_per_layer = visual_tokens
                 elif adapter_per_layer is not None:
                     adapter_per_layer += visual_tokens
-            if adapter_per_layer.shape[0] == 1:
+            if adapter_per_layer is not None and adapter_per_layer.shape[0] == 1:
                 adapter_per_layer = adapter_per_layer.repeat(_bsz, 1, 1)
             h = layer(h, start_pos, freqs_cis, mask, adapter_per_layer)
 
