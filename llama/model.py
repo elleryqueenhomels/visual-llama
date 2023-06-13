@@ -207,11 +207,10 @@ class Attention(nn.Module):
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
         if adapter is not None:
-           adapter_len = adapter.shape[1]
            adapter_k = forward_linear_with_scale_and_bias(adapter, self.wk, self.wk_scale, self.wk_bias)
-           adapter_k = adapter_k.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
+           adapter_k = self._reshape_adapter_view(adapter_k, adapter, bsz)
            adapter_v = forward_linear_with_scale_and_bias(adapter, self.wv, self.wv_scale, self.wv_bias)
-           adapter_v = adapter_v.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
+           adapter_v = self._reshape_adapter_view(adapter_v, adapter, bsz)
            adapter_k = adapter_k.transpose(1, 2)
            adapter_v = adapter_v.transpose(1, 2)
 
@@ -230,6 +229,15 @@ class Attention(nn.Module):
         ).contiguous().view(bsz, seqlen, -1)
 
         return forward_linear_with_scale_and_bias(output, self.wo, self.wo_scale, self.wo_bias)
+
+    def _reshape_adapter_view(self, input, adapter, batch_size):
+        total_size = 1
+        for dim in adapter.shape:
+            total_size *= dim
+        adapter_len = adapter.shape[1]
+        if total_size == batch_size * adapter_len * self.n_local_heads * self.head_dim:
+            return input.view(batch_size, adapter_len, self.n_local_heads, self.head_dim)
+        return input.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(batch_size, 1, 1, 1)
 
     def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
         if hasattr(F, "scaled_dot_product_attention"):
