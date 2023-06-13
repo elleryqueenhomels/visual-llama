@@ -118,7 +118,7 @@ class Trainer:
 
     def _run_batch(self, tokens, visual_tokens, labels):
         self.optimizer.zero_grad()
-        loss = self.model.forward_train(tokens, visual_tokens, labels)
+        loss = self.model(tokens, visual_tokens, labels)
         loss.backward()
         self.optimizer.step()
 

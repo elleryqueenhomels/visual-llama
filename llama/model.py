@@ -386,7 +386,7 @@ class Transformer(nn.Module):
         h = self.norm(h)
         return h
 
-    def forward_train(self, tokens, visual_tokens, labels):
+    def forward(self, tokens, visual_tokens, labels):
         h = self._compute_hidden(tokens=tokens, start_pos=0, visual_tokens=visual_tokens)
         output = self.output(h)
 
@@ -397,7 +397,7 @@ class Transformer(nn.Module):
         return loss
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int, visual_tokens: torch.Tensor = None):
+    def forward_inference(self, tokens: torch.Tensor, start_pos: int, visual_tokens: torch.Tensor = None):
         h = self._compute_hidden(tokens=tokens, start_pos=start_pos, visual_tokens=visual_tokens)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
