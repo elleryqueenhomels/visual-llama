@@ -6,11 +6,11 @@ from typing import List
 import torch
 
 from llama.tokenizer import Tokenizer
-from llama.model import Transformer
+from llama.model import Transformer, VisionModel
 
 
 class LLaMA:
-    def __init__(self, model: Transformer, tokenizer: Tokenizer, vision_model = None):
+    def __init__(self, model: Transformer, tokenizer: Tokenizer, vision_model: VisionModel = None):
         self.model = model
         self.tokenizer = tokenizer
         self.vision_model = vision_model
@@ -29,7 +29,7 @@ class LLaMA:
 
         vision_tokens = None
         if imgs is not None and self.vision_model is not None:
-            vision_tokens = self.vision_model(imgs)
+            vision_tokens = self.vision_model.forward_inference(imgs)
 
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 

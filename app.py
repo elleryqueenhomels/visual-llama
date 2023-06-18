@@ -30,7 +30,7 @@ def setup_model_parallel():
 
 setup_model_parallel()
 
-llama_dir = ""
+llama_dir = "/Path/to/LLaMA"
 tokenizer, model, visual_model = llama.load_model("BIAS-7B", llama_dir)
 llama_adapter = llama.LLaMA(model, tokenizer, visual_model)
 
@@ -42,13 +42,12 @@ def multi_modal_generate(
     top_p: float = 0.75,
 ):
     try:
-        imgs = [Image.open(img_path).convert('RGB')]
+        img = Image.open(img_path).convert('RGB')
     except:
         return ""
 
     prompt = llama.format_prompt(prompt)
-    result = llama_adapter.generate([prompt], imgs, max_gen_len, temperature, top_p)
-    print(result[0])
+    result = llama_adapter.generate([prompt], [img], max_gen_len, temperature, top_p)
     return result[0]
 
 
