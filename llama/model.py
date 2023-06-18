@@ -33,7 +33,7 @@ class ModelArgs:
     max_seq_len: int = 2048
 
     adapter_len: int = 10
-    adapter_layer: int = 30
+    adapter_layer: int = 31
 
     w_bias: bool = False
     w_lora: bool = False
@@ -401,7 +401,7 @@ class VisionModel(nn.Module):
         self.visual_proj_norm = nn.LayerNorm(params.dim)
 
     def clip_encode_image(self, x: torch.Tensor):
-        x = x.to(self.clip.visual.conv1.weight.dtype)
+        x = x.type_as(self.clip.visual.conv1.weight)
         x = self.clip.visual.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -422,7 +422,7 @@ class VisionModel(nn.Module):
             x = x @ self.clip.visual.proj
 
         return x
-    
+
     def forward_visual(self, visual_feats, bsz):
         visual_query = self.visual_query.weight.unsqueeze(0).repeat(bsz, 1, 1)
 

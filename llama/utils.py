@@ -76,7 +76,7 @@ def load_model(
     max_seq_len=512,
     max_batch_size=1,
     gpu_id=0,
-    download_root='ckpts'
+    download_root='ckpts',
 ):
     adapter_path = None
     if name in _MODELS:
@@ -108,9 +108,10 @@ def load_model(
     model_args.max_batch_size = max_batch_size
 
     # load model
-    torch.set_default_tensor_type(torch.cuda.HalfTensor)
     vision_model = VisionModel(model_args).cuda(gpu_id)
+    torch.set_default_tensor_type(torch.cuda.HalfTensor)
     model = Transformer(model_args).cuda(gpu_id)
+    torch.set_default_tensor_type(torch.FloatTensor)
 
     # load weights from checkpoints
     ckpts = sorted(Path(llama_dir).glob("*.pth"))
