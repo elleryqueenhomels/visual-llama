@@ -4,3 +4,4 @@
 from .generation import LLaMA
 from .model import ModelArgs, Transformer, VisionModel
 from .tokenizer import Tokenizer
+from .utils import format_prompt, load_model

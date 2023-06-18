@@ -5,8 +5,6 @@ from typing import Optional, Tuple
 from dataclasses import dataclass, field
 import math
 
-import clip
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -17,6 +15,9 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
     ColumnParallelLinear,
 )
+
+import clip
+from timm.models.vision_transformer import Block
 
 
 @dataclass
@@ -34,16 +35,17 @@ class ModelArgs:
     adapter_len: int = 10
     adapter_layer: int = 30
 
-    add_bias: bool = False
-    add_scale: bool = False
-
-    use_lora: bool = False
+    w_bias: bool = False
+    w_lora: bool = False
     lora_rank: int = 16
 
-    vision_clip_model: str = "ViT-L/14"
-    vision_dim: int = 512
-    vision_blocks: int = 2
-    vision_early_fusion: set = field(default_factory=set)
+    v_clip_model: str = "ViT-L/14"
+    v_embed_dim: int = 768
+    v_depth: int = 8
+    v_num_heads: int = 16
+    v_mlp_ratio: float = 4.0
+    v_truncate_query: bool = True
+    v_early_fusion: set = field(default_factory=set)
 
 
 class RMSNorm(torch.nn.Module):
@@ -89,15 +91,6 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def forward_linear_with_scale_and_bias(x, module, scale=None, bias=None):
-    if scale is not None:
-        x = x * scale
-    x = module(x)
-    if bias is not None:
-        x = x + bias
-    return x
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -108,7 +101,7 @@ class Attention(nn.Module):
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False,
+            bias=args.w_bias,
             gather_output=False,
             init_method=lambda x: x,
         )
@@ -129,10 +122,13 @@ class Attention(nn.Module):
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=False,
+            bias=args.w_bias,
             input_is_parallel=True,
             init_method=lambda x: x,
         )
+        if args.w_bias:
+            nn.init.constant_(self.wq.bias.data, 0)
+            nn.init.constant_(self.wo.bias.data, 0)
 
         self.cache_k = torch.zeros(
             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
@@ -141,28 +137,12 @@ class Attention(nn.Module):
             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
         ).cuda()
 
-        self.gate = torch.nn.Parameter(torch.zeros(1, args.n_heads, 1, 1))
+        self.gate = torch.nn.Parameter(torch.zeros(1, self.n_local_heads, 1, 1))
         self.head_start = self.n_local_heads * fs_init.get_model_parallel_rank()
         self.head_end = self.n_local_heads * (fs_init.get_model_parallel_rank() + 1)
 
-        if args.add_bias:
-            self.wq_bias, self.wk_bias, self.wv_bias = [
-                nn.Parameter(torch.zeros([self.n_local_heads * self.head_dim])) for _ in range(3)
-            ]
-            self.wo_bias = nn.Parameter(torch.zeros([args.dim]))
-        else:
-            self.wq_bias = self.wk_bias = self.wv_bias = self.wo_bias = None
-
-        if args.add_scale:
-            self.wq_scale, self.wk_scale, self.wv_scale = [
-                nn.Parameter(torch.ones([args.dim])) for _ in range(3)
-            ]
-            self.wo_scale = nn.Parameter(torch.ones([self.n_local_heads * self.head_dim]))
-        else:
-            self.wq_scale = self.wk_scale = self.wv_scale = self.wo_scale = None
-        
-        self.use_lora = args.use_lora
-        if args.use_lora:
+        self.use_lora = args.w_lora
+        if args.w_lora:
            self.lora_wq_l1 = nn.Linear(args.dim, args.lora_rank, bias=False)
            self.lora_wq_l2 = nn.Linear(args.lora_rank, args.dim, bias=False)
 
@@ -182,10 +162,8 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], adapter=None):
         bsz, seqlen, _ = x.shape
-        xq = forward_linear_with_scale_and_bias(x, self.wq, self.wq_scale, self.wq_bias)
-        xk = forward_linear_with_scale_and_bias(x, self.wk, self.wk_scale, self.wk_bias)
-        xv = forward_linear_with_scale_and_bias(x, self.wv, self.wv_scale, self.wv_bias)
 
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         if self.use_lora:
            xq = xq + self.lora_wq_l2(self.lora_wq_l1(x))
            xk = xk + self.lora_wk_l2(self.lora_wk_l1(x))
@@ -207,10 +185,9 @@ class Attention(nn.Module):
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
         if adapter is not None:
-           adapter_k = forward_linear_with_scale_and_bias(adapter, self.wk, self.wk_scale, self.wk_bias)
-           adapter_k = self._reshape_adapter_view(adapter_k, adapter, bsz)
-           adapter_v = forward_linear_with_scale_and_bias(adapter, self.wv, self.wv_scale, self.wv_bias)
-           adapter_v = self._reshape_adapter_view(adapter_v, adapter, bsz)
+           adapter_len = adapter.shape[1]
+           adapter_k = self.wk(adapter).view(bsz, adapter_len, self.n_local_heads, self.head_dim)
+           adapter_v = self.wv(adapter).view(bsz, adapter_len, self.n_local_heads, self.head_dim)
            adapter_k = adapter_k.transpose(1, 2)
            adapter_v = adapter_v.transpose(1, 2)
 
@@ -220,24 +197,16 @@ class Attention(nn.Module):
         output = self._forward_scaled_dot_product_attention(xq, keys, values, mask)
 
         if adapter is not None:
-            output += self.gate[
-                :, self.head_start : self.head_end
-            ].tanh().half() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
+            output += self.gate.tanh().half() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
 
         output = output.transpose(
             1, 2
         ).contiguous().view(bsz, seqlen, -1)
 
-        return forward_linear_with_scale_and_bias(output, self.wo, self.wo_scale, self.wo_bias)
-
-    def _reshape_adapter_view(self, input, adapter, batch_size):
-        total_size = 1
-        for dim in adapter.shape:
-            total_size *= dim
-        adapter_len = adapter.shape[1]
-        if total_size == batch_size * adapter_len * self.n_local_heads * self.head_dim:
-            return input.view(batch_size, adapter_len, self.n_local_heads, self.head_dim)
-        return input.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(batch_size, 1, 1, 1)
+        if self.use_lora:
+           return self.wo(output) + self.lora_wo_l2(self.lora_wo_l1(output))
+        else:
+           return self.wo(output)
 
     def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
         if hasattr(F, "scaled_dot_product_attention"):
@@ -266,29 +235,21 @@ class FeedForward(nn.Module):
         mp_size = fs_init.get_model_parallel_world_size()
 
         self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=args.w_bias, gather_output=False, init_method=lambda x: x
         )
         self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            hidden_dim, dim, bias=args.w_bias, input_is_parallel=True, init_method=lambda x: x
         )
         self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=args.w_bias, gather_output=False, init_method=lambda x: x
         )
+        if args.w_bias:
+            nn.init.constant_(self.w1.bias.data, 0)
+            nn.init.constant_(self.w2.bias.data, 0)
+            nn.init.constant_(self.w3.bias.data, 0)
 
-        if args.add_bias:
-            self.w1_bias, self.w3_bias = [nn.Parameter(torch.zeros([hidden_dim // mp_size])) for _ in range(2)]
-            self.w2_bias = nn.Parameter(torch.zeros([dim]))
-        else:
-            self.w1_bias = self.w2_bias = self.w3_bias = None
-
-        if args.add_scale:
-            self.w1_scale, self.w3_scale = [nn.Parameter(torch.ones([dim])) for _ in range(2)]
-            self.w2_scale = nn.Parameter(torch.ones([hidden_dim // mp_size]))
-        else:
-            self.w1_scale = self.w2_scale = self.w3_scale = None
-
-        self.use_lora = args.use_lora
-        if args.use_lora:
+        self.use_lora = args.w_lora
+        if args.w_lora:
            self.lora_w1_l1 = nn.Linear(dim, args.lora_rank, bias=False)
            self.lora_w1_l2 = nn.Linear(args.lora_rank, hidden_dim, bias=False)
            self.lora_w2_l1 = nn.Linear(hidden_dim, args.lora_rank, bias=False)
@@ -300,18 +261,16 @@ class FeedForward(nn.Module):
            nn.init.constant_(self.lora_w3_l2.weight.data, 0)
 
     def forward(self, x):
-        xw1 = forward_linear_with_scale_and_bias(x, self.w1, self.w1_scale, self.w1_bias)
-        xw3 = forward_linear_with_scale_and_bias(x, self.w3, self.w3_scale, self.w3_bias)
+        xw1, xw3 = self.w1(x), self.w3(x)
         if self.use_lora:
             xw1 = xw1 + self.lora_w1_l2(self.lora_w1_l1(x))
             xw3 = xw3 + self.lora_w3_l2(self.lora_w3_l1(x))
 
-        act = F.silu(xw1) * xw3
-        out = forward_linear_with_scale_and_bias(act, self.w2, self.w2_scale, self.w2_bias)
+        out = F.silu(xw1) * xw3
         if self.use_lora:
-            out = out + self.lora_w2_l2(self.lora_w2_l1(act))
-
-        return out
+            return self.w2(out) + self.lora_w2_l2(self.lora_w2_l1(out))
+        else:
+            return self.w2(out)
 
 
 class TransformerBlock(nn.Module):
@@ -376,7 +335,7 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=h.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for i, layer in enumerate(self.layers):
@@ -385,7 +344,7 @@ class Transformer(nn.Module):
             if adapter_per_layer is not None and adapter_per_layer.shape[0] == 1:
                 adapter_per_layer = adapter_per_layer.repeat(_bsz, 1, 1)
             if visual_tokens is not None:
-                if i in self.params.vision_early_fusion:
+                if i in self.params.v_early_fusion:
                     adapter_per_layer = visual_tokens
                 elif adapter_per_layer is not None:
                     adapter_per_layer += visual_tokens
@@ -417,21 +376,28 @@ class VisionModel(nn.Module):
 
         self.params = params
 
-        self.clip, self.clip_transform = clip.load(params.vision_clip_model)
+        self.clip, self.clip_transform = clip.load(params.v_clip_model)
         self.clip.float()
         for param in self.clip.parameters():
             param.requires_grad = False
 
-        self.clip_proj = nn.Linear(self.clip.visual.output_dim, params.vision_dim)
-        self.clip_proj_norm = nn.LayerNorm(params.vision_dim)
+        self.clip_proj = nn.Linear(self.clip.visual.output_dim, params.v_embed_dim)
+        self.clip_proj_norm = nn.LayerNorm(params.v_embed_dim)
 
-        self.visual_query = nn.Embedding(params.adapter_len, params.vision_dim)
+        self.visual_query = nn.Embedding(params.adapter_len, params.v_embed_dim)
 
-        self.visual_blocks = nn.ModuleList([
-            nn.MultiheadAttention(params.vision_dim, 16, add_bias_kv=True, batch_first=True)
-        for _ in range(params.vision_blocks)])
+        self.adapter_len = params.adapter_len
+        self.v_truncate_query = params.v_truncate_query
+        if params.v_truncate_query:
+            self.visual_blocks = nn.ModuleList([
+                Block(params.v_embed_dim, params.v_num_heads, params.v_mlp_ratio, qkv_bias=True)
+                for _ in range(params.v_depth)])
+        else:
+            self.visual_blocks = nn.ModuleList([
+                nn.MultiheadAttention(params.v_embed_dim, params.v_num_heads, add_bias_kv=True, batch_first=True)
+                for _ in range(params.v_depth)])
 
-        self.visual_proj = nn.Linear(params.vision_dim, params.dim)
+        self.visual_proj = nn.Linear(params.v_embed_dim, params.dim)
         self.visual_proj_norm = nn.LayerNorm(params.dim)
 
     def clip_encode_image(self, x: torch.Tensor):
@@ -470,10 +436,17 @@ class VisionModel(nn.Module):
         visual_feats = self.clip_proj_norm(visual_feats)
 
         visual_query = self.visual_query.weight.unsqueeze(0).repeat(_bsz, 1, 1)
-        for block in self.visual_blocks:
-            visual_query, _ = block(query=visual_query, key=visual_feats, value=visual_feats)
-
-        visual_query = self.visual_proj(visual_query)
-        visual_query = self.visual_proj_norm(visual_query)
+        if self.v_truncate_query:
+            visual_query = torch.cat([visual_query, visual_feats], dim=1)
+            for block in self.visual_blocks:
+                visual_query = block(visual_query)
+            visual_query = visual_query[:, :self.adapter_len, :]
+            visual_query = self.visual_proj(visual_query)
+            visual_query = self.visual_proj_norm(visual_query)
+        else:
+            for block in self.visual_blocks:
+                visual_query, _ = block(query=visual_query, key=visual_feats, value=visual_feats)
+            visual_query = self.visual_proj(visual_query)
+            visual_query = self.visual_proj_norm(visual_query)
 
         return visual_query

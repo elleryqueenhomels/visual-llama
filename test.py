@@ -4,13 +4,14 @@ import torch
 
 from PIL import Image
 from huggingface_hub import hf_hub_download
-from torch.distributed import is_initialized
+from torch.distributed import is_initialized, init_process_group
 from llama import LLaMA, ModelArgs, Tokenizer, Transformer, VisionModel
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
 
 def setup_model_parallel():
     os.environ['RANK'] = '0'
+    os.environ['LOCAL_RANK'] = '0'
     os.environ['WORLD_SIZE'] = '1'
     os.environ['MP'] = '1'
     os.environ['MASTER_ADDR'] = '127.0.0.1'
@@ -19,7 +20,7 @@ def setup_model_parallel():
     world_size = int(os.environ.get("WORLD_SIZE", -1))
 
     if not is_initialized():
-        torch.distributed.init_process_group("nccl")
+        init_process_group("nccl")
         initialize_model_parallel(world_size)
         torch.cuda.set_device(local_rank)
 
@@ -41,13 +42,12 @@ model_args = ModelArgs(
     max_seq_len = 512,
     adapter_len = 10,
     adapter_layer = 1,
-    vision_clip_model = "ViT-L/14",
-    vision_dim = 64,
-    vision_blocks = 2,
-    vision_early_fusion = {0},
-    add_bias=True,
-    add_scale=True,
-    use_lora=True,
+    v_clip_model = "ViT-L/14",
+    v_embed_dim = 64,
+    v_depth = 2,
+    v_early_fusion = {0},
+    w_bias=True,
+    w_lora=True,
 )
 
 tokenizer_path = hf_hub_download(
