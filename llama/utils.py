@@ -119,6 +119,6 @@ def load_model(
         ckpt = torch.load(ckpt, map_location='cpu')
         model.load_state_dict(ckpt, strict=False)
     if adapter_ckpt is not None:
-        model.load_state_dict(adapter_ckpt, strict=False)
-    
+        model.load_state_dict(adapter_ckpt['model'], strict=False)
+
     return tokenizer, model, vision_model
