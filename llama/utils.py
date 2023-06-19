@@ -70,6 +70,14 @@ def _download(url: str, root: str):
 
     return download_target
 
+def _transform_ckpt(ckpt, prefix='llama.'):
+    res = {}
+    for key in ckpt.keys():
+        if key.startswith(prefix):
+            new_key = key[len(prefix):]
+            res[new_key] = ckpt[key]
+    return res
+
 def load_model(
     name,
     llama_dir,
@@ -118,6 +126,8 @@ def load_model(
         ckpt = torch.load(ckpt, map_location='cpu')
         model.load_state_dict(ckpt, strict=False)
     if adapter_ckpt is not None:
+        vision_model.load_state_dict(adapter_ckpt['model'], strict=False)
         model.load_state_dict(adapter_ckpt['model'], strict=False)
+        model.load_state_dict(_transform_ckpt(adapter_ckpt['model']), strict=False)
 
     return tokenizer, model, vision_model
