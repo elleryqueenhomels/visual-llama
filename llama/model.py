@@ -138,8 +138,6 @@ class Attention(nn.Module):
         ).cuda()
 
         self.gate = torch.nn.Parameter(torch.zeros(1, self.n_local_heads, 1, 1))
-        self.head_start = self.n_local_heads * fs_init.get_model_parallel_rank()
-        self.head_end = self.n_local_heads * (fs_init.get_model_parallel_rank() + 1)
 
         self.use_lora = args.w_lora
         if args.w_lora:
@@ -231,8 +229,6 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-
-        mp_size = fs_init.get_model_parallel_world_size()
 
         self.w1 = ColumnParallelLinear(
             dim, hidden_dim, bias=args.w_bias, gather_output=False, init_method=lambda x: x
