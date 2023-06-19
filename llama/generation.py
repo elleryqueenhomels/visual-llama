@@ -60,6 +60,9 @@ class LLaMA:
             )
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
+            # trick: early stop if bsz == 1
+            if bsz == 1 and next_token[0] == self.tokenizer.eos_id:
+                break
 
         decoded = []
         for i, t in enumerate(tokens.tolist()):
