@@ -90,15 +90,14 @@ def load_model(
     with open(os.path.join(llama_dir, 'params.json'), "r") as f:
         model_args = json.loads(f.read())
 
-    # load adapter weights and model_cfg
+    # load adapter weights and adapter_cfg
     print(f'Loading Adapter from {adapter_path}')
     adapter_cfg = {}
     adapter_ckpt = None
     if adapter_path is not None:
         adapter_ckpt = torch.load(adapter_path, map_location='cpu')
         adapter_cfg = adapter_ckpt.get('config', {})
-    model_args = {**model_args, **adapter_cfg}
-    model_args = ModelArgs(**model_args)
+    model_args = ModelArgs(**model_args, **adapter_cfg)
 
     # load tokenizer
     tokenzier_path = os.path.join(llama_dir, 'tokenizer.model')
