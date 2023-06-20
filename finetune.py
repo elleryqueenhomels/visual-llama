@@ -105,7 +105,7 @@ class Trainer:
         self.optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             loss = self.model(tokens, visual_tokens, labels)
-        loss.backward()
+        loss.backward(retain_graph=True)
         self.optimizer.step()
 
     def _run_epoch(self, epoch):
