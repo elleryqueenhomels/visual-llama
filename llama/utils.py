@@ -26,7 +26,7 @@ _PROMPT_DICT = {
 }
 
 def format_prompt(instruction, input=None):
-    if input is None:
+    if input is None or input == "":
         return _PROMPT_DICT['prompt_no_input'].format_map({'instruction': instruction})
     else:
         return _PROMPT_DICT["prompt_input"].format_map({'instruction': instruction, 'input': input})
@@ -85,6 +85,7 @@ def load_model(
     max_batch_size=1,
     gpu_id=0,
     download_root='ckpts',
+    is_training=False,
 ):
     adapter_path = None
     if name in _MODELS:
@@ -129,5 +130,19 @@ def load_model(
         vision_model.load_state_dict(adapter_ckpt['model'], strict=False)
         model.load_state_dict(adapter_ckpt['model'], strict=False)
         model.load_state_dict(_transform_ckpt(adapter_ckpt['model']), strict=False)
+
+    if is_training:
+        for name, param in model.named_parameters():
+            requires_grad = (
+                name == "adapter_query"
+                or name.endswith(".gate")
+                or name.endswith(".bias")
+                or "lora_w" in name
+            )
+            if requires_grad:
+                param.data = param.data.float()
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     return tokenizer, model, vision_model

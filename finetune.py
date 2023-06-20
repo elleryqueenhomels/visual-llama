@@ -7,8 +7,8 @@ import numpy as np
 
 from PIL import Image
 from pathlib import Path
-from huggingface_hub import hf_hub_download
-from llama import ModelArgs, VisionModel, Tokenizer, Transformer
+from llama import VisionModel, Tokenizer, Transformer
+from llama import format_prompt, load_model
 
 import torch
 import torch.nn.functional as F
@@ -21,20 +21,6 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
-
-
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-}
 
 
 def setup_model_parallel():
@@ -53,10 +39,7 @@ def setup_random_seeds(random_seed=0):
 
 
 def construct_sample(ann: dict, tokenizer: Tokenizer, max_words: int):
-    if ann.get("input", "") == "":
-        prompt = PROMPT_DICT["prompt_no_input"].format_map(ann)
-    else:
-        prompt = PROMPT_DICT["prompt_input"].format_map(ann)
+    prompt = format_prompt(ann["instruction"], ann.get("input", ""))
     example = prompt + ann["output"]
     prompt = torch.tensor(tokenizer.encode(prompt, bos=True, eos=False), dtype=torch.int64)
     example = torch.tensor(tokenizer.encode(example, bos=True, eos=True), dtype=torch.int64)
@@ -102,16 +85,18 @@ class Trainer:
 
     def _load_snapshot(self):
         snapshot = torch.load(self.snapshot_path, map_location='cpu')
-        self.model.load_state_dict(snapshot["MODEL_STATE"])
-        self.optimizer.load_state_dict(snapshot["OPTIMIZER"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
+        self.model.load_state_dict(snapshot["model"], strict=False)
+        self.vision_model.load_state_dict(snapshot["vision_model"], strict=False)
+        self.optimizer.load_state_dict(snapshot["optimizer"], strict=False)
+        self.epochs_run = snapshot["epochs_run"]
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
     def _save_snapshot(self, epoch):
         snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),
-            "OPTIMIZER": self.optimizer.state_dict(),
-            "EPOCHS_RUN": epoch,
+            "model": self.model.module.state_dict(),
+            "vision_model": self.vision_model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epochs_run": epoch,
         }
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
@@ -184,55 +169,6 @@ class JointDataset(Dataset):
         return tokens, imgs, labels
 
 
-def build_model(args):
-    param_path = hf_hub_download(
-        repo_id="nyanko7/LLaMA-7B", filename="params.json")
-    tokenizer_path = hf_hub_download(
-        repo_id="nyanko7/LLaMA-7B", filename="tokenizer.model")
-    model_path = hf_hub_download(
-        repo_id="nyanko7/LLaMA-7B", filename="consolidated.00.pth")
-
-    with open(param_path, "r") as f:
-        params = json.loads(f.read())
-
-    model_args = ModelArgs(
-        max_seq_len=args.max_seq_len, max_batch_size=args.batch_size, **params)
-
-    tokenizer = Tokenizer(model_path=tokenizer_path)
-    model_args.vocab_size = tokenizer.n_words
-
-    gpu_id = int(os.environ["LOCAL_RANK"])
-
-    torch.set_default_tensor_type(torch.cuda.HalfTensor)
-    vision_model = VisionModel(model_args).cuda(gpu_id)
-    model = Transformer(model_args).cuda(gpu_id)
-
-    # To reduce memory usuage
-    # model_ckpt = torch.load(model_path, map_location=f'cuda:{gpu_id}')
-    # model.load_state_dict(model_ckpt, strict=False)
-    # del model_ckpt
-    # torch.cuda.empty_cache()
-    model_ckpt = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(model_ckpt, strict=False)
-    del model_ckpt
-
-    for name, param in model.named_parameters():
-        requires_grad = (
-            name == "adapter_query"
-            or name.endswith(".gate")
-            or name.endswith("_bias")
-            or name.endswith("_scale")
-            or "lora_w" in name
-        )
-        if requires_grad:
-            param.data = param.data.float()
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    return tokenizer, model, vision_model
-
-
 def prepare_dataloader(dataset: Dataset, batch_size: int):
     return DataLoader(
         dataset,
@@ -245,7 +181,14 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 def main(args):
     setup_model_parallel()
     setup_random_seeds(args.seed)
-    tokenizer, model, vision_model = build_model(args)
+    tokenizer, model, vision_model = load_model(
+        name="",
+        llama_dir=args.llama_model_path,
+        max_seq_len=args.max_seq_len,
+        max_batch_size=args.batch_size,
+        gpu_id=int(os.environ["LOCAL_RANK"]),
+        is_training=True,
+    )
     dataset = JointDataset(args, vision_model.clip_transform, tokenizer)
     train_data = prepare_dataloader(dataset, args.batch_size)
     trainer = Trainer(args, tokenizer, model, vision_model, train_data)
@@ -270,8 +213,8 @@ def get_args_parser():
     )
 
     # Model parameters
-    parser.add_argument("--llama_model_path", default="./llama", type=str, help="path of llama model")
-    parser.add_argument("--model", default="llama7B_adapter", type=str, metavar="MODEL", help="Name of model to train")
+    parser.add_argument("--llama_model_path", default="./LLaMA_7B", type=str, help="path of pre-trained llama model")
+    parser.add_argument("--adapter_model_path", default="./ckpt", type=str, metavar="MODEL", help="path of trained adapter params")
 
     parser.add_argument("--adapter_layer", type=int, default=30, metavar="LENGTH", help="the number of adapter layer")
 

@@ -419,8 +419,14 @@ class VisionModel(nn.Module):
 
         return x
 
-    def forward_visual(self, visual_feats, bsz):
-        visual_query = self.visual_query.weight.unsqueeze(0).repeat(bsz, 1, 1)
+    def forward_visual(self, x):
+        _bsz = x.shape[0]
+
+        visual_feats = self.clip_encode_image(x).float()
+        visual_feats = self.clip_proj(visual_feats)
+        visual_feats = self.clip_proj_norm(visual_feats)
+
+        visual_query = self.visual_query.weight.unsqueeze(0).repeat(_bsz, 1, 1)
 
         if self.v_truncate_query:
             visual_query = torch.cat([visual_query, visual_feats], dim=1)
@@ -443,22 +449,10 @@ class VisionModel(nn.Module):
         else:
             x = [img if torch.is_tensor(img) else self.clip_transform(img) for img in imgs]
             x = torch.stack(x, dim=0).to(self.visual_query.weight.device)
-        _bsz = x.shape[0]
+        return self.forward_visual(x)
 
-        visual_feats = self.clip_encode_image(x).half()
-        visual_feats = self.clip_proj(visual_feats)
-        visual_feats = self.clip_proj_norm(visual_feats)
-
-        return self.forward_visual(visual_feats, _bsz)
-    
     @torch.inference_mode()
     def forward_inference(self, imgs):
         x = [self.clip_transform(img) for img in imgs]
         x = torch.stack(x, dim=0)
-        _bsz = x.shape[0]
-
-        visual_feats = self.clip_encode_image(x).float()
-        visual_feats = self.clip_proj(visual_feats)
-        visual_feats = self.clip_proj_norm(visual_feats)
-
-        return self.forward_visual(visual_feats, _bsz)
+        return self.forward_visual(x)
