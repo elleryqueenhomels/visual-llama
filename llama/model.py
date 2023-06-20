@@ -192,10 +192,10 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        output = self._forward_scaled_dot_product_attention(xq, keys, values, mask)
+        output = self._forward_scaled_dot_product_attention(xq, keys, values, mask=mask)
 
         if adapter is not None:
-            output += self.gate.tanh().half() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
+            output = output + self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v, gate=self.gate)
 
         output = output.transpose(
             1, 2
@@ -206,14 +206,13 @@ class Attention(nn.Module):
         else:
            return self.wo(output)
 
-    def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
-        if hasattr(F, "scaled_dot_product_attention"):
-            return F.scaled_dot_product_attention(q, k, v, mask >= 0 if mask is not None else None)
-
+    def _forward_scaled_dot_product_attention(self, q, k, v, mask=None, gate=None):
         scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        if gate is not None:
+            scores = gate.tanh().half() * scores
         output = torch.matmul(scores, v)  # (bs, n_local_heads, slen, head_dim)
         return output
 
