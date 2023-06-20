@@ -5,7 +5,6 @@ import json
 import random
 import numpy as np
 
-from PIL import Image
 from pathlib import Path
 from llama import VisionModel, Tokenizer, Transformer
 from llama import format_prompt, load_model

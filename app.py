@@ -30,9 +30,11 @@ def setup_model_parallel():
 
 setup_model_parallel()
 
+
 llama_dir = "/Path/to/LLaMA"
 tokenizer, model, visual_model = llama.load_model("BIAS-7B", llama_dir)
 llama_adapter = llama.LLaMA(model, tokenizer, visual_model)
+
 
 def multi_modal_generate(
     img_path: str,
