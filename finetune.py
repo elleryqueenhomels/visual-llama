@@ -23,6 +23,7 @@ from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
 
 def setup_model_parallel():
+    os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
     init_process_group(backend="nccl")
     initialize_model_parallel(int(os.environ["WORLD_SIZE"]))
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -102,7 +103,8 @@ class Trainer:
 
     def _run_batch(self, tokens, visual_tokens, labels):
         self.optimizer.zero_grad()
-        loss = self.model(tokens, visual_tokens, labels)
+        with torch.cuda.amp.autocast():
+            loss = self.model(tokens, visual_tokens, labels)
         loss.backward()
         self.optimizer.step()
 

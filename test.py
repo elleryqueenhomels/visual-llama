@@ -28,6 +28,60 @@ def setup_model_parallel():
     torch.manual_seed(1)
     return local_rank, world_size
 
+def load_test_model(
+    name,
+    llama_dir,
+    max_seq_len=256,
+    max_batch_size=8,
+    gpu_id=0,
+    download_root='ckpts',
+    is_training=False,
+):
+    model_args = ModelArgs(
+        dim = 64,
+        n_layers = 4,
+        n_heads = 4,
+        vocab_size = 32,
+        multiple_of = 32,
+        max_seq_len = 512,
+        adapter_len = 10,
+        adapter_layer = 2,
+        v_clip_model = "ViT-L/14",
+        v_embed_dim = 64,
+        v_depth = 2,
+        w_bias=True,
+        w_lora=True,
+    )
+
+    # load tokenizer
+    tokenzier_path = os.path.join(llama_dir, 'tokenizer.model')
+    tokenizer = Tokenizer(model_path=tokenzier_path)
+    model_args.vocab_size = tokenizer.n_words
+    model_args.max_seq_len = max_seq_len
+    model_args.max_batch_size = max_batch_size
+
+    # load model
+    vision_model = VisionModel(model_args).cuda(gpu_id)
+    torch.set_default_tensor_type(torch.cuda.HalfTensor)
+    model = Transformer(model_args).cuda(gpu_id)
+    torch.set_default_tensor_type(torch.FloatTensor)
+
+    if is_training:
+        for name, param in model.named_parameters():
+            requires_grad = (
+                name == "adapter_query"
+                or name.endswith(".gate")
+                or name.endswith(".bias")
+                or "lora_w" in name
+            )
+            if requires_grad:
+                param.data = param.data.float()
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+    return tokenizer, model, vision_model
+
 local_rank, world_size = setup_model_parallel()
 if local_rank > 0:
     sys.stdout = open(os.devnull, "w")
