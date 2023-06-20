@@ -35,7 +35,7 @@ class Trainer:
         self.tokenizer = tokenizer
         self.vision_model = vision_model
         self.model = model.to(self.gpu_id)
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
+        self.model = DDP(self.model, device_ids=[self.gpu_id], static_graph=True)
         param_groups = optim_factory.add_weight_decay(self.model.module, args.weight_decay)
         self.optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
         self.epochs_run = 0
@@ -66,6 +66,7 @@ class Trainer:
         self.optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             loss = self.model(tokens, visual_tokens, labels)
+        print(f"loss: {loss.item()}")
         loss.backward(retain_graph=True)
         self.optimizer.step()
 
@@ -73,10 +74,13 @@ class Trainer:
         b_sz = len(next(iter(self.train_data))[0])
         print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
+        step = 0
         for tokens, imgs, labels in self.train_data:
+            print(f"Epoch: {epoch} | Step: {step}")
             tokens = tokens.to(self.gpu_id)
             visual_tokens = self.vision_model(imgs)
             self._run_batch(tokens, visual_tokens, labels)
+            step += 1
 
     def train(self):
         for epoch in range(self.epochs_run, self.args.epochs):
