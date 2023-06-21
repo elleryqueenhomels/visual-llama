@@ -83,6 +83,10 @@ class Trainer:
             step += 1
 
     def train(self):
+        print("Trainable Params of LLaMA:")
+        print([(key, val.shape) for key, val in self.model.named_parameters() if val.requires_grad])
+        print("Trainable Params of Vision Model:")
+        print([(key, val.shape) for key, val in self.vision_model.named_parameters() if val.requires_grad])
         for epoch in range(self.epochs_run, self.args.epochs):
             self._run_epoch(epoch)
             if self.gpu_id == 0 and epoch % self.args.save_every == 0:
