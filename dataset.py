@@ -1,3 +1,4 @@
+import os
 import copy
 import json
 import yaml
@@ -120,7 +121,8 @@ class FinetuneDataset(Dataset):
             question = data_item['conversations'][0]['value']
             answer = data_item['conversations'][1]['value']
 
-            image = Image.open(f"{self.coco_dir}/{filename}").convert('RGB')
+            img_path = os.path.join(self.coco_dir, filename)
+            image = Image.open(img_path).convert('RGB')
             image = self.img_transform_fn(image)
             format_instruction = question
             format_input = None
