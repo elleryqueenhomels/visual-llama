@@ -81,7 +81,7 @@ class Trainer:
             sys.exit(1)
         loss /= self.args.accum_iter
         update_grad = (step + 1) % self.args.accum_iter == 0
-        self.loss_scaler(loss, self.optimizer, parameters=self.model.parameters(), update_grad=update_grad)
+        self.loss_scaler(loss, self.optimizer, parameters=self.model.parameters(), retain_graph=True, update_grad=update_grad)
         if update_grad:
             self.optimizer.zero_grad()
         torch.cuda.synchronize()
