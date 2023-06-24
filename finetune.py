@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
+import misc
 from llama import VisionModel, Tokenizer, Transformer
 from llama import load_model
 from dataset import JointDataset
@@ -44,6 +45,7 @@ class Trainer:
 
         param_groups = optim_factory.add_weight_decay(self.model.module, args.weight_decay)
         self.optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+        self.loss_scaler = misc.NativeScalerWithGradNormCount()
 
         self.epochs_run = 0
         self.snapshot_path = args.resume
@@ -56,28 +58,33 @@ class Trainer:
         self.model.load_state_dict(snapshot["model"], strict=False)
         self.vision_model.load_state_dict(snapshot["vision_model"], strict=False)
         self.optimizer.load_state_dict(snapshot["optimizer"], strict=False)
+        self.loss_scaler.load_state_dict(snapshot["scaler"], state_dict=False)
         self.epochs_run = snapshot["epochs_run"]
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
     def _save_snapshot(self, epoch):
         snapshot = {
-            "model": self.model.module.state_dict(),
+            "model": self.model.state_dict(),
             "vision_model": self.vision_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "scaler": self.loss_scaler.state_dict(),
             "epochs_run": epoch,
         }
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
 
-    def _run_batch(self, tokens, visual_tokens, labels):
-        self.optimizer.zero_grad()
+    def _run_batch(self, tokens, visual_tokens, labels, step):
         with torch.cuda.amp.autocast():
             loss = self.model(tokens, visual_tokens, labels)
         if not math.isfinite(loss.item()):
             print(f"Loss is {loss.item()}. Stop training. Exit...")
             sys.exit(1)
-        loss.backward(retain_graph=True)
-        self.optimizer.step()
+        loss /= self.args.accum_iter
+        update_grad = (step + 1) % self.args.accum_iter == 0
+        self.loss_scaler(loss, self.optimizer, parameters=self.model.parameters(), update_grad=update_grad)
+        if update_grad:
+            self.optimizer.zero_grad()
+        torch.cuda.synchronize()
 
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
@@ -85,15 +92,17 @@ class Trainer:
 
         step = 0
         self.train_data.sampler.set_epoch(epoch)
+        self.optimizer.zero_grad()
+
         for tokens, imgs, labels in self.train_data:
             print(f"Epoch: {epoch} | Step: {step}")
 
             if step % self.args.accum_iter == 0:
-                adjust_learning_rate(self.optimizer, step + len(self.train_data) + epoch, self.args)
+                misc.adjust_learning_rate(self.optimizer, step + len(self.train_data) + epoch, self.args)
 
             tokens = tokens.to(self.gpu_id)
             visual_tokens = self.vision_model(imgs)
-            self._run_batch(tokens, visual_tokens, labels)
+            self._run_batch(tokens, visual_tokens, labels, step)
             step += 1
 
     def train(self):
@@ -134,21 +143,6 @@ def setup_random_seeds(random_seed=0):
     cudnn.benchmark = False
     np.random.seed(random_seed)
     random.seed(random_seed)
-
-
-def adjust_learning_rate(optimizer, epoch, args):
-    """Decay the learning rate with half-cycle cosine after warmup"""
-    if epoch < args.warmup_epochs:
-        lr = args.lr * epoch / args.warmup_epochs 
-    else:
-        lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * \
-            (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
-    for param_group in optimizer.param_groups:
-        if "lr_scale" in param_group:
-            param_group["lr"] = lr * param_group["lr_scale"]
-        else:
-            param_group["lr"] = lr
-    return lr
 
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
