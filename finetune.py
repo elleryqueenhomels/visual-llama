@@ -1,5 +1,7 @@
 import argparse
 import os
+import sys
+import math
 import random
 import numpy as np
 from pathlib import Path
@@ -28,16 +30,21 @@ class Trainer:
         model: Transformer,
         vision_model: VisionModel,
         train_data: DataLoader,
-    ) -> None:
+    ):
         self.args = args
         self.gpu_id = int(os.environ["LOCAL_RANK"])
+        self.world_size = int(os.environ["WORLD_SIZE"])
+
         self.train_data = train_data
         self.tokenizer = tokenizer
         self.vision_model = vision_model
+
         self.model = model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id], static_graph=True)
+
         param_groups = optim_factory.add_weight_decay(self.model.module, args.weight_decay)
         self.optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+
         self.epochs_run = 0
         self.snapshot_path = args.resume
         if os.path.exists(self.snapshot_path):
@@ -66,17 +73,24 @@ class Trainer:
         self.optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             loss = self.model(tokens, visual_tokens, labels)
-        print(f"loss: {loss.item()}")
+        if not math.isfinite(loss.item()):
+            print(f"Loss is {loss.item()}. Stop training. Exit...")
+            sys.exit(1)
         loss.backward(retain_graph=True)
         self.optimizer.step()
 
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
-        self.train_data.sampler.set_epoch(epoch)
+        print(f"[GPU {self.gpu_id}] Epoch: {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+
         step = 0
+        self.train_data.sampler.set_epoch(epoch)
         for tokens, imgs, labels in self.train_data:
             print(f"Epoch: {epoch} | Step: {step}")
+
+            if step % self.args.accum_iter == 0:
+                adjust_learning_rate(self.optimizer, step + len(self.train_data) + epoch, self.args)
+
             tokens = tokens.to(self.gpu_id)
             visual_tokens = self.vision_model(imgs)
             self._run_batch(tokens, visual_tokens, labels)
@@ -87,6 +101,19 @@ class Trainer:
         print([(key, val.shape) for key, val in self.model.named_parameters() if val.requires_grad])
         print("Trainable Params of Vision Model:")
         print([(key, val.shape) for key, val in self.vision_model.named_parameters() if val.requires_grad])
+
+        # lr preparation
+        eff_batch_size = self.args.batch_size * self.args.accum_iter * self.world_size
+
+        if self.args.lr is None:
+            # only base_lr is specified
+            self.args.lr = self.args.blr * eff_batch_size / 256
+
+        print("base lr: %.2e" % self.args.blr)
+        print("actual lr: %.2e" % self.args.lr)
+        print("effective batch size: %d" % eff_batch_size)
+        print("accumulate grad iterations: %d" % self.args.accum_iter)
+
         for epoch in range(self.epochs_run, self.args.epochs):
             self._run_epoch(epoch)
             if self.gpu_id == 0 and epoch % self.args.save_every == 0:
@@ -107,6 +134,21 @@ def setup_random_seeds(random_seed=0):
     cudnn.benchmark = False
     np.random.seed(random_seed)
     random.seed(random_seed)
+
+
+def adjust_learning_rate(optimizer, epoch, args):
+    """Decay the learning rate with half-cycle cosine after warmup"""
+    if epoch < args.warmup_epochs:
+        lr = args.lr * epoch / args.warmup_epochs 
+    else:
+        lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * \
+            (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
+    for param_group in optimizer.param_groups:
+        if "lr_scale" in param_group:
+            param_group["lr"] = lr * param_group["lr_scale"]
+        else:
+            param_group["lr"] = lr
+    return lr
 
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
@@ -138,46 +180,25 @@ def main(args):
 
 def get_args_parser():
     parser = argparse.ArgumentParser("LLaMA fine-tuning", add_help=False)
-    parser.add_argument(
-        "--batch_size",
-        default=64,
-        type=int,
-        help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
-    )
-    parser.add_argument("--epochs", default=400, type=int)
-    parser.add_argument(
-        "--accum_iter",
-        default=1,
-        type=int,
-        help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
-    )
 
     # Model parameters
     parser.add_argument("--llama_model_path", default="./LLaMA_7B", type=str, help="path of pre-trained llama model")
-    parser.add_argument("--adapter_model_path", default="./ckpt", type=str, metavar="MODEL", help="path of trained adapter params")
+    parser.add_argument("--adapter_model_path", default="./ckpt", type=str, help="path of trained adapter params")
 
-    parser.add_argument("--adapter_layer", type=int, default=30, metavar="LENGTH", help="the number of adapter layer")
+    parser.add_argument("--max_seq_len", type=int, default=512, help="the maximum sequence length")
+    parser.add_argument("--adapter_len", type=int, default=10, help="the adapter length")
+    parser.add_argument("--adapter_layer", type=int, default=30, help="the number of adapter layer")
 
-    parser.add_argument("--adapter_len", type=int, default=10, metavar="LENGTH", help="the adapter length")
+    # Training parameters
+    parser.add_argument("--batch_size", default=64, type=int, help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus")
+    parser.add_argument("--epochs", default=400, type=int)
 
-    parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
-
-    # Optimizer parameters
+    parser.add_argument("--accum_iter", default=1, type=int, help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)")
+    parser.add_argument("--warmup_epochs", type=int, default=40, help="epochs to warmup LR")
+    parser.add_argument("--lr", type=float, default=1e-5, help="learning rate (absolute lr)")
+    parser.add_argument("--blr", type=float, default=1e-3, help="base learning rate: absolute_lr = base_lr * total_batch_size / 256")
+    parser.add_argument("--min_lr", type=float, default=0.0, help="lower lr bound for cyclic schedulers that hit 0")
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
-
-    parser.add_argument("--lr", type=float, default=1e-5, metavar="LR", help="learning rate (absolute lr)")
-    parser.add_argument(
-        "--blr",
-        type=float,
-        default=1e-3,
-        metavar="LR",
-        help="base learning rate: absolute_lr = base_lr * total_batch_size / 256",
-    )
-    parser.add_argument(
-        "--min_lr", type=float, default=0.0, metavar="LR", help="lower lr bound for cyclic schedulers that hit 0"
-    )
-
-    parser.add_argument("--warmup_epochs", type=int, default=40, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
     parser.add_argument("--inst_path", default="./instruction_dataset/data.json", type=str, help="instruction dataset path")
@@ -186,26 +207,24 @@ def get_args_parser():
 
     parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
     parser.add_argument("--log_dir", default="./output_dir", help="path where to tensorboard log")
-    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
-    parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--resume", default="", help="resume from checkpoint")
 
-    parser.add_argument("--start_epoch", default=0, type=int, metavar="N", help="start epoch")
-    parser.add_argument("--num_workers", default=10, type=int)
-    parser.add_argument(
-        "--pin_mem",
-        action="store_true",
-        help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.",
-    )
+    parser.add_argument("--pin_mem", action="store_true", help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.")
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
+    parser.add_argument("--seed", default=0, type=int, help="fix the seed for reproducibility")
+    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--world_size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--local_rank", default=-1, type=int)
+
     parser.add_argument("--dist_on_itp", action="store_true")
     parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
+    parser.add_argument("--num_workers", default=10, type=int)
+
+    parser.add_argument("--start_epoch", default=0, type=int, help="start epoch")
     parser.add_argument('--save_every', default=8, type=int, help='How often to save a snapshot')
+    parser.add_argument("--resume", default="", help="resume from checkpoint")
 
     return parser
 
