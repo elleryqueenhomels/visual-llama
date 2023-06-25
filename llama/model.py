@@ -47,6 +47,8 @@ class ModelArgs:
     v_truncate_query: bool = True
     v_early_fusion: set = field(default_factory=set)
 
+    is_training: bool = False
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -130,12 +132,16 @@ class Attention(nn.Module):
             nn.init.constant_(self.wq.bias.data, 0)
             nn.init.constant_(self.wo.bias.data, 0)
 
-        self.cache_k = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
+        if args.is_training:
+            self.cache_k = None
+            self.cache_v = None
+        else:
+            self.cache_k = torch.zeros(
+                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+            ).cuda()
+            self.cache_v = torch.zeros(
+                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+            ).cuda()
 
         self.gate = torch.nn.Parameter(torch.zeros(1, self.n_local_heads, 1, 1))
 
@@ -173,14 +179,18 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        self.cache_k = self.cache_k.to(xq)
-        self.cache_v = self.cache_v.to(xq)
+        if self.cache_k is not None and self.cache_v is not None:
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+            keys = self.cache_k[:bsz, : start_pos + seqlen]
+            values = self.cache_v[:bsz, : start_pos + seqlen]
+        else:
+            keys = xk
+            values = xv
 
         if adapter is not None:
            adapter_len = adapter.shape[1]

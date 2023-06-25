@@ -86,6 +86,8 @@ def load_model(
     gpu_id=0,
     download_root='ckpts',
     is_training=False,
+    w_bias=None,
+    w_lora=None,
 ):
     adapter_path = None
     if name in _MODELS:
@@ -111,9 +113,16 @@ def load_model(
     # load tokenizer
     tokenzier_path = os.path.join(llama_dir, 'tokenizer.model')
     tokenizer = Tokenizer(model_path=tokenzier_path)
+
+    # override parts of model_args
     model_args.vocab_size = tokenizer.n_words
     model_args.max_seq_len = max_seq_len
     model_args.max_batch_size = max_batch_size
+    model_args.is_training = is_training
+    if w_bias is not None:
+        model_args.w_bias = w_bias
+    if w_lora is not None:
+        model_args.w_lora = w_lora
 
     # load model
     vision_model = VisionModel(model_args).cuda(gpu_id)

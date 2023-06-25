@@ -43,6 +43,7 @@ class Trainer:
         self.model = model.to(self.gpu_id)
         self.model = DDP(self.model, device_ids=[self.gpu_id], static_graph=True)
 
+        self._prepare_learning_rate()
         param_groups = optim_factory.add_weight_decay(self.model.module, args.weight_decay)
         self.optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
         self.loss_scaler = misc.NativeScalerWithGradNormCount()
@@ -104,25 +105,22 @@ class Trainer:
             visual_tokens = self.vision_model(imgs)
             self._run_batch(tokens, visual_tokens, labels, step)
             step += 1
+    
+    def _prepare_learning_rate(self):
+        eff_batch_size = self.args.batch_size * self.args.accum_iter * self.world_size
+        if self.args.lr is None:
+            # only base_lr is specified
+            self.args.lr = self.args.blr * eff_batch_size / 256
+        print("base lr: %.2e" % self.args.blr)
+        print("actual lr: %.2e" % self.args.lr)
+        print("effective batch size: %d" % eff_batch_size)
+        print("accumulate grad iterations: %d" % self.args.accum_iter)
 
     def train(self):
         print("Trainable Params of LLaMA:")
         print([(key, val.shape) for key, val in self.model.named_parameters() if val.requires_grad])
         print("Trainable Params of Vision Model:")
         print([(key, val.shape) for key, val in self.vision_model.named_parameters() if val.requires_grad])
-
-        # lr preparation
-        eff_batch_size = self.args.batch_size * self.args.accum_iter * self.world_size
-
-        if self.args.lr is None:
-            # only base_lr is specified
-            self.args.lr = self.args.blr * eff_batch_size / 256
-
-        print("base lr: %.2e" % self.args.blr)
-        print("actual lr: %.2e" % self.args.lr)
-        print("effective batch size: %d" % eff_batch_size)
-        print("accumulate grad iterations: %d" % self.args.accum_iter)
-
         for epoch in range(self.epochs_run, self.args.epochs):
             self._run_epoch(epoch)
             if self.gpu_id == 0 and epoch % self.args.save_every == 0:
@@ -189,7 +187,7 @@ def get_args_parser():
 
     parser.add_argument("--accum_iter", default=1, type=int, help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)")
     parser.add_argument("--warmup_epochs", type=int, default=40, help="epochs to warmup LR")
-    parser.add_argument("--lr", type=float, default=1e-5, help="learning rate (absolute lr)")
+    parser.add_argument("--lr", type=float, default=None, help="learning rate (absolute lr)")
     parser.add_argument("--blr", type=float, default=1e-3, help="base learning rate: absolute_lr = base_lr * total_batch_size / 256")
     parser.add_argument("--min_lr", type=float, default=0.0, help="lower lr bound for cyclic schedulers that hit 0")
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
