@@ -127,7 +127,14 @@ class Trainer:
                 self._save_snapshot(epoch)
 
 
-def setup_model_parallel():
+def setup_model_parallel(args):
+    if args.no_torchrun:
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ['MP'] = '1'
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '2223'
     os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
     init_process_group(backend="nccl")
     initialize_model_parallel(int(os.environ["WORLD_SIZE"]))
@@ -153,7 +160,7 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 
 
 def main(args):
-    setup_model_parallel()
+    setup_model_parallel(args)
     setup_random_seeds(args.seed)
     tokenizer, model, vision_model = load_model(
         name="",
@@ -205,6 +212,7 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
+    parser.add_argument("--no_torchrun", default=False, type=bool, help="used in the VM which has no torchrun command")
     parser.add_argument("--seed", default=0, type=int, help="fix the seed for reproducibility")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--world_size", default=1, type=int, help="number of distributed processes")
