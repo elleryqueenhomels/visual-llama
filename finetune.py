@@ -82,6 +82,8 @@ class Trainer:
             sys.exit(1)
         loss /= self.args.accum_iter
         update_grad = (step + 1) % self.args.accum_iter == 0
+        if self.args.is_debug:
+            print(f"loss: {loss.item()}")
         self.loss_scaler(loss, self.optimizer, parameters=self.model.parameters(), retain_graph=True, update_grad=update_grad)
         if update_grad:
             self.optimizer.zero_grad()
@@ -99,7 +101,8 @@ class Trainer:
             print(f"Epoch: {epoch} | Step: {step}")
 
             if step % self.args.accum_iter == 0:
-                misc.adjust_learning_rate(self.optimizer, step + len(self.train_data) + epoch, self.args)
+                lr = misc.adjust_learning_rate(self.optimizer, step + len(self.train_data) + epoch, self.args)
+                print(f"adjusting lr: {lr}")
 
             tokens = tokens.to(self.gpu_id)
             visual_tokens = self.vision_model(imgs)
@@ -212,6 +215,7 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
+    parser.add_argument("--is_debug", default=True, type=bool, help="if set, will print more detailed info during training")
     parser.add_argument("--no_torchrun", default=False, type=bool, help="used in the VM which has no torchrun command")
     parser.add_argument("--seed", default=0, type=int, help="fix the seed for reproducibility")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
